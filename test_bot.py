@@ -89,7 +89,39 @@ def main():
     res = bot.forecast_question(q_binary(), "k", "m")
     assert res["method"] == "fallback", res["method"]
 
+    test_cdf_validator_rules()
+
     print("ALL TESTS PASSED")
+
+
+def test_cdf_validator_rules():
+    import bot
+    cases = [
+        ({10: 0.0, 25: 10.0, 50: 50.0, 75: 90.0, 90: 100.0}, True, True),
+        ({10: 50.0, 25: 50.0, 50: 50.0, 75: 50.0, 90: 50.0}, True, True),   # flat
+        ({10: 99.0, 25: 99.5, 50: 99.9, 75: 100.0, 90: 100.0}, True, True), # piled at top
+        ({10: 0.0, 25: 0.1, 50: 0.2, 75: 0.3, 90: 0.4}, True, True),        # piled at bottom
+        ({10: 0.0, 25: 10.0, 50: 50.0, 75: 90.0, 90: 100.0}, False, False), # closed bounds
+        ({10: 4.3, 20: 5.58, 40: 6.86, 60: 8.14, 80: 9.42, 90: 10.7}, True, True),  # discrete-like
+
+    ]
+    for pct, o_lo, o_hi in cases:
+        cdf = bot.percentiles_to_cdf(pct, 0.0, 100.0, open_lo=o_lo, open_hi=o_hi)
+        assert len(cdf) == 201
+        steps = [cdf[i + 1] - cdf[i] for i in range(200)]
+        assert min(steps) >= 5e-05 - 1e-12, (pct, min(steps))
+        if o_lo:
+            assert cdf[0] >= 0.001, cdf[0]
+        else:
+            assert cdf[0] == 0.0, cdf[0]
+        if o_hi:
+            assert cdf[-1] <= 0.999, cdf[-1]
+        else:
+            assert cdf[-1] == 1.0, cdf[-1]
+    cdf16 = bot.percentiles_to_cdf({10: 4.3, 20: 5.58, 40: 6.86, 60: 8.14, 80: 9.42, 90: 10.7},
+                                   0.0, 15.0, size=16)
+    steps16 = [cdf16[i + 1] - cdf16[i] for i in range(15)]
+    assert min(steps16) >= 0.000625, min(steps16)
 
 
 if __name__ == "__main__":

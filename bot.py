@@ -235,7 +235,8 @@ def fallback_numeric_percentiles(q: dict) -> tuple[dict[int, float], str]:
 # --------------------------------------------------------------------------
 
 def percentiles_to_cdf(percentiles: dict[int, float], lo: float, hi: float,
-                       size: int = 201) -> list[float]:
+                       size: int = 201, open_lo: bool = True,
+                       open_hi: bool = True) -> list[float]:
     pts = sorted((p / 100.0, v) for p, v in percentiles.items())
     # value at percentile y via linear interpolation, flat extrapolation
     def value_at(y: float) -> float:
@@ -256,20 +257,41 @@ def percentiles_to_cdf(percentiles: dict[int, float], lo: float, hi: float,
         x = lo + (hi - lo) * i / (size - 1)
         # invert: find y such that value_at(y) == x, by scanning the segments
         y = _invert(value_at, x, pts)
-        # enforce Metaculus standardization: strictly increasing, min step,
-        # and no single step above 0.2 of mass
-        y = max(y, prev + (0.01 / (size - 1)) if i > 0 else y)
+        # keep steps within the API's max single-step mass (0.2)
         y = min(y, prev + 0.19) if i > 0 else y
         y = min(max(y, 0.0), 1.0)
         cdf.append(y)
         prev = y
-    # final point must be exactly 1.0 for closed upper bound handling; keep
-    # monotonic after forcing
-    cdf[-1] = 1.0
-    for i in range(size - 2, -1, -1):
-        if cdf[i] > cdf[i + 1]:
-            cdf[i] = cdf[i + 1]
-    return cdf
+    return _sanitize_cdf(cdf, open_lo, open_hi)
+
+
+def _sanitize_cdf(cdf: list[float], open_lo: bool, open_hi: bool) -> list[float]:
+    """Enforce the Metaculus CDF validator's rules (learned from a live HTTP 400
+    on 2026-11-11): every step must increase by >= 5e-05; an OPEN lower bound
+    requires cdf[0] >= 0.001 and an OPEN upper bound requires cdf[-1] <= 0.999.
+    Closed bounds pin the endpoints to exactly 0.0 / 1.0."""
+    step = max(6e-05, 0.0125 / len(cdf))  # API min step is 0.01/len(cdf) (5e-05
+    # at 201 points, 0.000625 at 16 — learned from a live discrete HTTP 400)
+    lo_b = 0.001 if open_lo else 0.0
+    hi_b = 0.999 if open_hi else 1.0
+    # Work a hair inside the open bounds: float subtraction chains can land an
+    # epsilon outside them (observed: cdf[0] = 0.0009999999999999992).
+    eff_lo = lo_b + 1e-6 if open_lo else 0.0
+    eff_hi = hi_b - 1e-6 if open_hi else 1.0
+    size = len(cdf)
+    out = [min(max(v, eff_lo), eff_hi) for v in cdf]
+    for i in range(1, size):  # forward: enforce min step
+        out[i] = max(out[i], out[i - 1] + step)
+    out[-1] = eff_hi  # pin the top endpoint
+    for i in range(size - 2, -1, -1):  # backward: restore min step under the pin
+        out[i] = min(out[i], out[i + 1] - step)
+    if not open_lo:
+        out[0] = 0.0
+    ok = (out[0] >= lo_b and out[-1] <= hi_b
+          and all(out[i + 1] - out[i] >= 0.0105 / size for i in range(size - 1)))
+    if not ok:  # pathological input: a plain linear ramp always validates
+        out = [eff_lo + (eff_hi - eff_lo) * i / (size - 1) for i in range(size)]
+    return out
 
 
 def _invert(value_at, x: float, pts) -> float:
@@ -534,7 +556,9 @@ def forecast_question(q: dict, api_key: str | None, model: str) -> dict:
         if qtype == "discrete" and scaling.get("inbound_outcome_count"):
             size = int(scaling["inbound_outcome_count"]) + 1
         cdf = percentiles_to_cdf(percentiles, float(scaling["range_min"]),
-                                 float(scaling["range_max"]), size=size)
+                                 float(scaling["range_max"]), size=size,
+                                 open_lo=q.get("open_lower_bound") is not False,
+                                 open_hi=q.get("open_upper_bound") is not False)
         payload = {"probability_yes": None, "probability_yes_per_category": None,
                    "continuous_cdf": cdf}
         forecast_repr = {"percentiles": percentiles}
@@ -658,7 +682,12 @@ def main(argv=None) -> int:
                    f"{('%.0f%%' % (q['community_prediction'] * 100)) if q.get('community_prediction') is not None else 'n/a'}",
                    "", "**Reasoning:**", "", result["reasoning"], ""]
         if args.submit:
-            submit_forecast(q, result, token)  # guarded above: token required
+            try:
+                submit_forecast(q, result, token)  # guarded above: token required
+            except Exception as e:  # one rejected forecast must not kill the run
+                print(f"submit FAILED for {q.get('question_id')}: {e}")
+                report += [f"- **SUBMIT FAILED:** {e}", ""]
+                continue
             if q.get("question_id") is not None:
                 done.add(q["question_id"])
             submitted += 1
