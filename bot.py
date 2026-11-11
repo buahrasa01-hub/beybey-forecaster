@@ -84,7 +84,8 @@ def _request(method: str, url: str, *, token: str | None = None,
             body = e.read().decode("utf-8", "replace")[:500]
             raise RuntimeError(f"HTTP {e.code} for {url}: {body}") from None
         except (http.client.IncompleteRead, json.JSONDecodeError,
-                ConnectionError, TimeoutError) as e:
+                ConnectionError, TimeoutError, urllib.error.URLError,
+                OSError) as e:  # proxy tunnel timeouts surface as URLError
             last_err = e
     raise RuntimeError(f"request to {url} failed after retry: {last_err}")
 
